@@ -10,10 +10,12 @@ class UnifiedDiffPatcher {
     private $debug = false;
     private $arrError = array();
     private $patch = false;
+    private $hunkCompleted = 0;
 
     //Patch file
     protected $patchHandle = null;
-    protected $curPatchLine = 0;
+    protected $patchPath = null;
+    protected $patchLine = 0;
 
     //Destination file ( resulting patched file )
     protected $dstHandle = null;
@@ -71,40 +73,42 @@ class UnifiedDiffPatcher {
     /**
      * Validate a patch file.
      *
-     * @param string $patchFile File path
+     * @param string|resource $patchFile File path or stream file
      * @param integer $patch_level -p param of the patch command
      *
-     * @return bool true if no error.
+     * @return mixed false if error, or hunk count.
      */
     public function processPatch($patchFile, $patchLevel = '-1', $debug = false) {
 
         $this->patch = true;
         $this->debug = (bool)$debug;
+        $this->hunkCompleted = 0;
 
         $this->openPatch($patchFile);
         $this->processFiles($patchLevel);
 
-        return !$this->hasError();
+        return $this->hasError() ? false : $this->hunkCompleted;
     }
 
     /**
      * Validate a patch file.
      *
-     * @param string $patchFile File path
+     * @param string|resource $patchFile File path or strem file
      * @param integer $patch_level -p param of the patch command
      *
-     * @return bool true if no error.
+     * @return mixed false if error, or hunk count.
      */
     public function validatePatch($patchFile, $patchLevel = '-1', $debug = false) {
 
         $this->patch = false;
         $this->debug = (bool)$debug;
+        $this->hunkCompleted = 0;
 
         $this->debug("Validating patch ( read-only mode )");
         $this->openPatch($patchFile);
         $this->processFiles($patchLevel);
 
-        return !$this->hasError();
+        return $this->hasError() ? false : $this->hunkCompleted;
     }
 
     /**
@@ -116,7 +120,7 @@ class UnifiedDiffPatcher {
      */
     protected function processFiles($patchLevel) {
         $line = fgets($this->patchHandle);
-        $this->curPatchLine++;
+        $this->patchLine++;
         $this->srcHandle = null;
 
         //Loop in all the line of the patch file.
@@ -149,18 +153,18 @@ class UnifiedDiffPatcher {
                 }
 
                 //Open source file
-                $this->srcHandle = fopen($this->srcPath, "r");
+                $this->srcHandle = @fopen($this->srcPath, "r");
                 $this->srcLine = 0;
                 if (!$this->srcHandle) {
-                    $this->addError(sprintf("File %s not found.", $this->srcHandle));
+                    $this->addError(sprintf("File %s not found.", $this->srcPath));
                     $this->srcHandle = null; //Make the loop skip all the file hunks.
                 }
 
                 if ($this->patch) {
                     //Open destination file
-                    $this->dstHandle = fopen($this->dstPath, "w");
+                    $this->dstHandle = @fopen($this->dstPath, "w");
                     if (!$this->dstHandle) {
-                        $this->addError(sprintf("File %s not found.", $this->dstHandle));
+                        $this->addError(sprintf("File %s not found.", $this->dstPath));
                         $this->srcHandle = null; //Make the loop skip all the file hunks.
                     }
                 }
@@ -168,7 +172,7 @@ class UnifiedDiffPatcher {
 
 
             $line = fgets($this->patchHandle);
-            $this->curPatchLine++;
+            $this->patchLine++;
         } while (false !== $line);
     }
 
@@ -194,10 +198,11 @@ class UnifiedDiffPatcher {
                 $from = $arrHunk['srcBegLine'];
                 $to = $arrHunk['srcBegLine']+$arrHunk['srcLastLine']-1;
                 $this->debug(sprintf("\t\tModified lines %u to %u.", $from, $to));
+                $this->hunkCompleted++;
             }
 
-
-            if ($cmd == 'O' || $cmd == 'd') { //Only or diff mean all hunk of this dst file have been processed.
+			// \ No newline at end of file
+            if ($cmd == 'O' || $cmd == 'd' || $cmd == '\\') { //Only or diff mean all hunk of this dst file have been processed.
                 return;
 
             } else if ($cmd == '@') { //We're entering a new hunk
@@ -226,13 +231,13 @@ class UnifiedDiffPatcher {
                     }
                 }
             } else {
-                $this->addError(sprintf("Line #%u of the patch file seems invalid.", $this->curPatchLine));
+                $this->addError(sprintf("Line #%u of the patch file seems invalid.", $this->patchLine));
 
             }
 
 
             $line = fgets($this->patchHandle);
-            $this->curPatchLine++;
+            $this->patchLine++;
         } while (false !== $line);
     }
 
@@ -243,10 +248,10 @@ class UnifiedDiffPatcher {
         if($cmd != '+') { // ' ' or '-' : compare to validate
 
             $srcLine = fgets($this->srcHandle);
-            $diff = strcmp($code, $srcLine);
+            $diff = strcmp(rtrim($code, "\n\r"), rtrim($srcLine, "\n\r")); // This rtrim fix is needed as the current code doesn't really support the \ No newline at end of file indicator.
 
             if ($diff !== 0) {
-                $this->addError(sprintf("Line #%u of the patch file could not be matched with line #%u of %s.", $this->curPatchLine, $this->srcLine, $this->srcPath));
+                $this->addError(sprintf("Line #%u of the patch file could not be matched with line #%u of %s.", $this->patchLine, $this->srcLine, $this->srcPath));
 
                 return false;
             }
@@ -276,13 +281,23 @@ class UnifiedDiffPatcher {
      * @return Resource File handle to patch file.
      */
     protected function openPatch($filePath) {
-        $this->debug(sprintf("Openning %s", $filePath));
 
-        $this->patchHandle = fopen($filePath, "r");
-        $this->curPatchLine = 0;
-        if (!$this->patchHandle) {
-            throw new Exception(sprintf("Could not open file %s.", $filePath));
+        if (is_resource($filePath)) {
+            $this->debug(sprintf("Openning patch from memory"));
+            $this->patchHandle = $filePath;
+            $this->patchPath = null;
+            $this->patchLine = 0;
+        } else {
+            $this->debug(sprintf("Openning %s", $filePath));
+            $this->patchHandle = @fopen($filePath, "r");
+            $this->patchPath = $filePath;
+            $this->patchLine = 0;
+            if (!$this->patchHandle) {
+                throw new Exception(sprintf("Could not open file %s.", $filePath));
+            }
         }
+
+
 
         return true;
     }
